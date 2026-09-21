@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ayaanmotiwala/holybackend
-          ref: main
+          ref: production
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
 
