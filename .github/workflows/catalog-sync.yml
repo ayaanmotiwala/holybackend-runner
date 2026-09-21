@@ -7,6 +7,9 @@ name: Catalog sync
 
 on:
   workflow_dispatch:
+  schedule:
+    # GitHub cron uses UTC. 02:00, 08:00, 14:00, and 20:00 Asia/Kolkata.
+    - cron: "30 2,8,14,20 * * *"
 
 permissions: {}
 
