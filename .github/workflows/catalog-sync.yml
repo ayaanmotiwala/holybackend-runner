@@ -1,9 +1,13 @@
+# Runner v2 (Gen2 Phase 7) — install as .github/workflows/catalog-sync.yml in the PUBLIC
+# ayaanmotiwala/holybackend-runner repo at release time (replaces the single-job workflow).
+#
+# plan -> scrape[shards] -> verify -> listings -> media -> sync[shards] -> maintenance
+# Shards are numbers only; each job picks its sources/stores from the database, so no
+# source or store names ever appear in these public logs. All output is suppressed.
+#
+# SECURITY: never add pull_request/pull_request_target triggers, artifact uploads, caches,
+# or steps that print files or environment variables.
 name: Catalog sync
-
-# Runs the private holybackend pipeline. The code is fetched at run time with a
-# read-only token and is never stored in this repository.
-# SECURITY: never add pull_request/pull_request_target triggers, artifact uploads,
-# caches, or steps that print files or environment variables. Logs are public.
 
 on:
   workflow_dispatch:
@@ -18,9 +22,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90  # a first run for a new store creates thousands of listings; normal runs take ~15 min
+    timeout-minutes: 10
+    outputs:
+      scrape_shards: ${{ steps.plan.outputs.scrape_shards }}
+      sync_shards: ${{ steps.plan.outputs.sync_shards }}
+      scrape_total: ${{ steps.plan.outputs.shard_total_scrape }}
+      sync_total: ${{ steps.plan.outputs.shard_total_sync }}
     steps:
       - name: Fetch private code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -29,12 +38,10 @@ jobs:
           ref: production
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           persist-credentials: false
-
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-
       - name: Restore environment
         shell: bash
         env:
@@ -43,13 +50,218 @@ jobs:
           if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
           printf '%s\n' "$HOLYBACKEND_ENV" > .env
           chmod 600 .env
-
       - name: Install
         run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
-
-      - name: Run pipeline (output hidden)
+      - name: Apply the supplier registry (output hidden)
         env:
-          # Stores added from the admin keep their Shopify secret encrypted; without this the
-          # pipeline cannot open them.
           CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
-        run: python -m apps.worker.scheduled_runner > /dev/null 2>&1 || { echo "Pipeline failed; see scrape_runs in Supabase/admin" >&2; exit 1; }
+        # Suppliers are declared in src/sources/catalog.py. This makes the database
+        # match it before the work is shared out, so a supplier added in code is
+        # scraped on the same run it ships. It never fails the sync on its own.
+        run: python -m apps.worker.stage_runner registry > /dev/null 2>&1 || echo "Registry step reported a problem" >&2
+      - name: Plan (output hidden)
+        id: plan
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner plan --github-output "$GITHUB_OUTPUT" > /dev/null 2>&1 || { echo "Plan failed" >&2; exit 1; }
+
+  scrape:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.scrape_shards) }}
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Scrape (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner scrape --shard ${{ matrix.shard }} --shards ${{ needs.plan.outputs.scrape_total }} > /dev/null 2>&1 || { echo "Scrape failed" >&2; exit 1; }
+
+  verify:
+    needs: [plan, scrape]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Verify (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner verify > /dev/null 2>&1 || { echo "Verify failed" >&2; exit 1; }
+
+  listings:
+    needs: [plan, verify]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Listings (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner listings > /dev/null 2>&1 || { echo "Listings failed" >&2; exit 1; }
+
+  media:
+    needs: [plan, listings]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Media (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner media > /dev/null 2>&1 || { echo "Media failed" >&2; exit 1; }
+
+  sync:
+    needs: [plan, media]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.sync_shards) }}
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Sync (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner sync --shard ${{ matrix.shard }} --shards ${{ needs.plan.outputs.sync_total }} > /dev/null 2>&1 || { echo "Sync failed" >&2; exit 1; }
+
+  maintenance:
+    needs: [plan, sync]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch private code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ayaanmotiwala/holybackend
+          ref: production
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Restore environment
+        shell: bash
+        env:
+          HOLYBACKEND_ENV: ${{ secrets.HOLYBACKEND_ENV }}
+        run: |
+          if [ -z "$HOLYBACKEND_ENV" ]; then echo "HOLYBACKEND_ENV secret is missing" >&2; exit 1; fi
+          printf '%s\n' "$HOLYBACKEND_ENV" > .env
+          chmod 600 .env
+      - name: Install
+        run: python -m pip install -q . > /dev/null 2>&1 || { echo "Install failed" >&2; exit 1; }
+      - name: Maintenance (output hidden)
+        env:
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+        run: python -m apps.worker.stage_runner maintenance > /dev/null 2>&1 || { echo "Maintenance failed" >&2; exit 1; }
